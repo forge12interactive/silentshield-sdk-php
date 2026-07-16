@@ -1,0 +1,17 @@
+{
+    "name": "silentshield/sdk",
+    "description": "SilentShield PHP SDK — human/form verification plus fire-and-forget AI-agent observation in one dependency-free package.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["silentshield", "bot", "verification", "ai-agent", "telemetry", "captcha", "geo"],
+    "homepage": "https://silentshield.io",
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "SilentShield\\": "src/"
+        }
+    },
+    "minimum-stability": "stable"
+}
