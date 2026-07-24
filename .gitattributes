@@ -1,0 +1,3 @@
+# Keep the packagist/composer dist tarball lean — ship only src + docs.
+/tests           export-ignore
+/.gitattributes  export-ignore

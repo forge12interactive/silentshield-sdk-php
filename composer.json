@@ -1,5 +1,5 @@
 {
-    "name": "silentshield/sdk",
+    "name": "forge12interactive/silentshield-sdk",
     "description": "SilentShield PHP SDK — human/form verification, AI-agent observation, and policy enforcement (block AI bots) in one dependency-free package.",
     "type": "library",
     "license": "MIT",
@@ -14,8 +14,22 @@
         "enforce"
     ],
     "homepage": "https://silentshield.io",
+    "authors": [
+        {
+            "name": "Forge12 Interactive",
+            "email": "info@forge12.com",
+            "homepage": "https://silentshield.io"
+        }
+    ],
+    "support": {
+        "email": "info@forge12.com",
+        "docs": "https://silentshield.io/docs/integration/agent-enforce"
+    },
     "require": {
-        "php": ">=8.1"
+        "php": ">=8.1",
+        "ext-sodium": "*",
+        "ext-curl": "*",
+        "ext-json": "*"
     },
     "autoload": {
         "psr-4": {
