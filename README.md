@@ -138,6 +138,14 @@ the bundle is `monitor` → nothing blocks). Bots are *verified* only when their
 source IP is in the operator's published range; behind a reverse proxy, restore
 the real client IP into `$_SERVER['REMOTE_ADDR']`.
 
+### Block reporting
+
+When the enforcer blocks a request it fire-and-forgets a report to SilentShield
+(after `fastcgi_finish_request`, so it never delays the response) so the
+dashboard's **blocked-bots report** has data. Only blocks are reported. It is on
+by default; pass `['disable_block_reports' => true]` to the constructor to stay
+silent (or `['report_url' => '…']` to override the endpoint).
+
 > Using **WordPress**? The SilentShield plugin ships this enforcer built-in from
 > v2.9.0 — enable it under Advanced → "Block AI crawlers (enforce)". No code.
 

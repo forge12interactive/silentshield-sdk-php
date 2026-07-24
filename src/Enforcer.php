@@ -31,8 +31,9 @@ namespace SilentShield;
  */
 final class Enforcer
 {
-    private const POLICY_URL = 'https://api.silentshield.io/api/v1/agent/policy';
-    private const KEYS_URL   = 'https://api.silentshield.io/.well-known/silentshield-agent-keys';
+    private const POLICY_URL    = 'https://api.silentshield.io/api/v1/agent/policy';
+    private const KEYS_URL      = 'https://api.silentshield.io/.well-known/silentshield-agent-keys';
+    private const TELEMETRY_URL = 'https://api.silentshield.io/api/v1/agent/telemetry';
 
     /** Re-fetch the bundle at most this often (seconds). */
     private const REFRESH_INTERVAL = 300;
@@ -44,22 +45,30 @@ final class Enforcer
     private string $apiKey;
     private string $policyUrl;
     private string $keysUrl;
+    private string $reportUrl;
+    private bool $reportBlocks;
     private int $timeout;
     private bool $insecure;
     private string $cacheDir;
 
     /**
      * @param string               $apiKey Publishable, domain-bound site key.
-     * @param array<string,mixed>  $opts   policy_url, keys_url, timeout, insecure, cache_dir
+     * @param array<string,mixed>  $opts   policy_url, keys_url, report_url, timeout,
+     *                                     insecure, cache_dir, disable_block_reports
      */
     public function __construct(string $apiKey, array $opts = [])
     {
         $this->apiKey    = $apiKey;
         $this->policyUrl = (string) ($opts['policy_url'] ?? self::POLICY_URL);
         $this->keysUrl   = (string) ($opts['keys_url']   ?? self::KEYS_URL);
+        $this->reportUrl = (string) ($opts['report_url'] ?? self::TELEMETRY_URL);
         $this->timeout   = (int) ($opts['timeout']       ?? 5);
         $this->insecure  = (bool) ($opts['insecure']     ?? false);
         $this->cacheDir  = rtrim((string) ($opts['cache_dir'] ?? sys_get_temp_dir()), '/\\');
+        // plan/65: report deny/throttle blocks to the telemetry endpoint so the
+        // dashboard's "blocked bots" report has data. On by default (only blocks
+        // are reported — a rare event); set disable_block_reports to silence it.
+        $this->reportBlocks = $this->apiKey !== '' && empty($opts['disable_block_reports']);
     }
 
     /**
@@ -71,6 +80,7 @@ final class Enforcer
     public function enforce(?array $server = null): void
     {
         try {
+            $server ??= $_SERVER;
             $d = $this->decide($server);
             if ($d === null) {
                 return;
@@ -83,9 +93,45 @@ final class Enforcer
                 }
             }
             echo $d['status'] === 429 ? 'Too Many Requests' : 'Forbidden';
+            // plan/65: report the block AFTER flushing the response, so the
+            // telemetry POST never delays the blocked request.
+            if (\function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            }
+            $this->reportBlock($server, (int) $d['status']);
             exit;
         } catch (\Throwable $e) {
             // Fail-open: never break the site.
+        }
+    }
+
+    /**
+     * Fire-and-forget a telemetry report that this request was blocked (plan/65),
+     * feeding the dashboard's "blocked bots" report. Best-effort — swallows every
+     * error. Public so standalone decide() users can report too.
+     *
+     * @param array<string,mixed> $server
+     */
+    public function reportBlock(array $server, int $status): void
+    {
+        if (!$this->reportBlocks) {
+            return;
+        }
+        try {
+            $sighting = [
+                'ua'      => isset($server['HTTP_USER_AGENT']) ? (string) $server['HTTP_USER_AGENT'] : '',
+                'ip'      => isset($server['REMOTE_ADDR']) ? (string) $server['REMOTE_ADDR'] : '',
+                'path'    => $this->requestPath($server),
+                'method'  => isset($server['REQUEST_METHOD']) ? strtoupper((string) $server['REQUEST_METHOD']) : 'GET',
+                'outcome' => $status === 429 ? 'throttle' : 'deny',
+            ];
+            $this->httpPost(
+                $this->reportUrl,
+                ['Content-Type: application/json', 'x-api-key: ' . $this->apiKey],
+                (string) json_encode(['sightings' => [$sighting]]),
+            );
+        } catch (\Throwable $e) {
+            // best-effort
         }
     }
 
@@ -413,6 +459,31 @@ final class Enforcer
             return null;
         }
         return $body;
+    }
+
+    /**
+     * Fire-and-forget POST for a block report. Best-effort — return value and any
+     * error are ignored.
+     *
+     * @param array<int,string> $headers
+     */
+    private function httpPost(string $url, array $headers, string $body): void
+    {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => $this->timeout,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_POSTFIELDS     => $body,
+            CURLOPT_SSL_VERIFYPEER => !$this->insecure,
+            CURLOPT_SSL_VERIFYHOST => $this->insecure ? 0 : 2,
+        ]);
+        @curl_exec($ch);
+        curl_close($ch);
     }
 
     /** @param array<string,mixed> $server */

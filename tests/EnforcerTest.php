@@ -99,6 +99,21 @@ check('cidr v6 in', true, priv($enf, 'ipInCidr', ['2001:db8::1', '2001:db8::/32'
 check('cidr v6 out', false, priv($enf, 'ipInCidr', ['2001:dead::1', '2001:db8::/32']));
 check('cidr family mismatch', false, priv($enf, 'ipInCidr', ['10.0.0.1', '2001:db8::/32']));
 
+// --- block reporting flag (plan/65) ---
+function privProp(Enforcer $enf, string $prop)
+{
+    $p = new \ReflectionProperty(Enforcer::class, $prop);
+    $p->setAccessible(true);
+    return $p->getValue($enf);
+}
+check('reportBlocks on by default', true, privProp($enf, 'reportBlocks'));
+check('reportBlocks off when disabled', false, privProp(new Enforcer('test-key', ['disable_block_reports' => true]), 'reportBlocks'));
+check('reportBlocks off without api key', false, privProp(new Enforcer(''), 'reportBlocks'));
+// A disabled reporter must be a no-op (no network, no throw).
+$noop = new Enforcer('test-key', ['disable_block_reports' => true]);
+$noop->reportBlock(['HTTP_USER_AGENT' => 'GPTBot', 'REMOTE_ADDR' => '1.2.3.4', 'REQUEST_URI' => '/x', 'REQUEST_METHOD' => 'GET'], 403);
+check('reportBlock is a no-op when disabled', true, true);
+
 echo "\n";
 if ($failures > 0) {
     echo "RESULT: {$failures} test(s) FAILED\n";
