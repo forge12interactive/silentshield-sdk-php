@@ -103,6 +103,44 @@ A dependency-free test runner is included:
 C:\xampp\php\php.exe tests\ClientTest.php
 ```
 
+## Enforcement — actually block AI bots (`Enforcer`)
+
+`Client::observe()` only records visits. To **block** disallowed bots per the
+policy you set in the SilentShield dashboard, use the `Enforcer`. It fetches the
+signed policy bundle, verifies its Ed25519 signature (libsodium) against the
+pinned keys, caches it on disk, and decides per request — a **403** for a denied
+bot, **429** for a throttled one. **Fail-open:** any error, an unverifiable
+bundle, or monitor mode lets the request through.
+
+Drop it in at the very top of your front controller:
+
+```php
+require __DIR__ . '/vendor/autoload.php';
+
+// Blocks + exits on a denied bot; otherwise returns and your app continues.
+(new \SilentShield\Enforcer('YOUR_SITE_KEY'))->enforce();
+```
+
+Or decide yourself:
+
+```php
+$decision = (new \SilentShield\Enforcer('YOUR_SITE_KEY'))->decide();
+if ($decision !== null) {
+    http_response_code($decision['status']);          // 403 or 429
+    if ($decision['retry_after'] > 0) header('Retry-After: ' . $decision['retry_after']);
+    exit;
+}
+```
+
+Requirements: `ext-sodium` + `ext-curl` (both in PHP 8.1 core). For a real block,
+`agent_gateway_enforce` must be enabled and a Block rule set on the key (otherwise
+the bundle is `monitor` → nothing blocks). Bots are *verified* only when their
+source IP is in the operator's published range; behind a reverse proxy, restore
+the real client IP into `$_SERVER['REMOTE_ADDR']`.
+
+> Using **WordPress**? The SilentShield plugin ships this enforcer built-in from
+> v2.9.0 — enable it under Advanced → "Block AI crawlers (enforce)". No code.
+
 ## License
 
 MIT
