@@ -27,8 +27,47 @@ final class Client
     private const TELEMETRY_URL      = 'https://api.silentshield.io/api/v1/agent/telemetry';
     private const BOT_DIRECTORY_URL  = 'https://api.silentshield.io/api/v1/agent/bot-directory';
 
-    /** A submission is human iff confidence meets this floor. */
-    private const HUMAN_CONFIDENCE_THRESHOLD = 0.7;
+    /**
+     * Minimum confidence required on top of a "human" verdict. Zero: the verdict
+     * is trusted on its own.
+     *
+     * This was 0.7, and it quietly overrode the site owner's own setting. The
+     * service decides human-or-not against the bot threshold configured in their
+     * dashboard — 0.30 by default — and then reports the score as `confidence`.
+     * A second threshold here rejected the whole band in between: measured on
+     * production, a submission scored 0.345, came back ok with verdict "human",
+     * was recorded by the service as a passed check, and this client still
+     * answered "not human", so the site turned a real visitor away.
+     */
+    private const HUMAN_CONFIDENCE_THRESHOLD = 0.0;
+
+    /**
+     * Why the last verify() answered false. Read it with lastFailure().
+     *
+     * verify() returns a bool, and a bool cannot distinguish "the service
+     * judged this a bot" from "we never got an answer". That difference is not
+     * academic: when a site's monthly quota runs out the service answers 429,
+     * this client fails secure, and every REAL visitor is turned away as if
+     * they were a bot — on a site whose owner sees nothing but "bot check
+     * failed" and reasonably blames the bot detection.
+     *
+     * verify() keeps its meaning (fail-secure). These constants only let you
+     * see the reason and decide for yourself — see the README for the
+     * recommended handling of FAILURE_QUOTA_EXCEEDED.
+     */
+    public const FAILURE_NONE           = '';                // verify() returned true
+    public const FAILURE_BOT            = 'bot';             // answered, not human — the intended case
+    public const FAILURE_QUOTA_EXCEEDED = 'quota_exceeded';  // 429, monthly quota used up
+    public const FAILURE_RATE_LIMITED   = 'rate_limited';    // 429, short-lived
+    public const FAILURE_HTTP           = 'http';            // any other non-2xx
+    public const FAILURE_TRANSPORT      = 'transport';       // no answer at all
+    public const FAILURE_MALFORMED      = 'malformed';       // answer we could not read
+
+    /** @var string One of the FAILURE_* constants; set by every verify() call. */
+    private string $lastFailure = self::FAILURE_NONE;
+
+    /** @var int|null Seconds until the quota resets, from Retry-After. Null when unknown. */
+    private ?int $lastRetryAfter = null;
 
     /** Bot-directory cache time-to-live in seconds (~24h). */
     private const DIRECTORY_CACHE_TTL = 86400;
@@ -102,18 +141,32 @@ final class Client
      * Fail-secure: any transport error, non-2xx status, malformed body, or a
      * verdict that is not a confident "human" returns false.
      *
-     * @param string $nonce The nonce collected from the submitted form.
-     * @return bool True only when the submitter is a confident human.
+     * @param string      $nonce   The nonce collected from the submitted form.
+     * @param string|null $pageUrl The page the form sits on. Optional; when
+     *        omitted it is auto-detected from $_SERVER. Sent so the dashboard
+     *        can name a form the server checks but no scan ever found — a
+     *        server-to-server verify carries no Referer, so this is the only
+     *        way that page reaches the service. Never affects the verdict.
+     * @return bool True only when the service judged the submitter human.
      */
-    public function verify(string $nonce): bool
+    public function verify(string $nonce, ?string $pageUrl = null): bool
     {
-        $payload = json_encode(['nonce' => $nonce], JSON_UNESCAPED_SLASHES);
+        $body = ['nonce' => $nonce];
+        $page = $pageUrl ?? $this->currentPageUrl();
+        if ($page !== '') {
+            $body['page_url'] = $page;
+        }
+        $payload = json_encode($body, JSON_UNESCAPED_SLASHES);
         if ($payload === false) {
             return false; // encoding failed — fail secure
         }
 
+        $this->lastFailure    = self::FAILURE_NONE;
+        $this->lastRetryAfter = null;
+
         $ch = curl_init(self::VERIFY_URL);
         if ($ch === false) {
+            $this->lastFailure = self::FAILURE_TRANSPORT;
             return false;
         }
 
@@ -135,21 +188,106 @@ final class Client
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        if (!is_string($body) || $status < 200 || $status >= 300) {
-            return false; // transport/HTTP error — fail secure
+        if (!is_string($body)) {
+            $this->lastFailure = self::FAILURE_TRANSPORT;
+            return false; // no answer at all — fail secure
+        }
+
+        if ($status < 200 || $status >= 300) {
+            // Read the reason BEFORE failing. A 429 has two very different
+            // meanings and the body is what tells them apart.
+            $this->lastFailure = self::classifyErrorBody($status, $body);
+            if ($this->lastFailure === self::FAILURE_QUOTA_EXCEEDED) {
+                $decoded = json_decode($body, true);
+                if (is_array($decoded) && isset($decoded['month']['ResetSecs'])) {
+                    $this->lastRetryAfter = (int) $decoded['month']['ResetSecs'];
+                }
+            }
+            return false; // HTTP error — fail secure
         }
 
         $data = json_decode($body, true);
         if (!is_array($data)) {
+            $this->lastFailure = self::FAILURE_MALFORMED;
             return false; // malformed body — fail secure
         }
 
-        // Human iff: ok === true && verdict === "human" && confidence >= 0.7
+        // Human iff: ok === true && verdict === "human" (the verdict already
+        // carries the owner's threshold; see HUMAN_CONFIDENCE_THRESHOLD).
         $ok         = ($data['ok'] ?? null) === true;
         $verdict    = ($data['verdict'] ?? null) === 'human';
         $confidence = (float) ($data['confidence'] ?? 0.0);
 
-        return $ok && $verdict && $confidence >= self::HUMAN_CONFIDENCE_THRESHOLD;
+        $human = $ok && $verdict && $confidence >= self::HUMAN_CONFIDENCE_THRESHOLD;
+        if (!$human) {
+            // The service answered and said no. This is the ONLY case in which
+            // turning the submission away is what the site owner asked for.
+            $this->lastFailure = self::FAILURE_BOT;
+        }
+
+        return $human;
+    }
+
+    /**
+     * Why the last verify() returned false — one of the FAILURE_* constants.
+     *
+     * Returns FAILURE_NONE after a successful verify. The case worth handling
+     * is FAILURE_QUOTA_EXCEEDED: the service never assessed this visitor at
+     * all, so rejecting them says nothing about whether they were human.
+     *
+     * ```php
+     * if (!$client->verify($nonce)) {
+     *     if ($client->lastFailure() === Client::FAILURE_QUOTA_EXCEEDED) {
+     *         // Our quota is used up — this is OUR billing state, not the
+     *         // visitor's fault. Fall back to your own checks (honeypot,
+     *         // timing) instead of turning real people away for weeks.
+     *         error_log('SilentShield quota exhausted, resets in '
+     *             . ($client->lastRetryAfter() ?? 0) . 's');
+     *     } else {
+     *         reject();
+     *     }
+     * }
+     * ```
+     */
+    public function lastFailure(): string
+    {
+        return $this->lastFailure;
+    }
+
+    /**
+     * Seconds until the quota resets, when the last failure was
+     * FAILURE_QUOTA_EXCEEDED. Null otherwise. A monthly quota resets on the
+     * 1st, so expect a value in days — that alone tells it apart from a rate
+     * limit, which is over in seconds.
+     */
+    public function lastRetryAfter(): ?int
+    {
+        return $this->lastRetryAfter;
+    }
+
+    /**
+     * Maps a non-2xx answer to a FAILURE_* constant.
+     *
+     * A 429 is the whole reason this exists: the quota middleware, the API-key
+     * guard and the rate limiter all answer 429, and only the body says which
+     * one it was. Static and pure so it can be tested without a network.
+     */
+    private static function classifyErrorBody(int $status, string $body): string
+    {
+        if ($status !== 429) {
+            return self::FAILURE_HTTP;
+        }
+
+        $decoded = json_decode($body, true);
+        $error   = is_array($decoded) ? ($decoded['error'] ?? '') : '';
+
+        if ($error === 'quota_exceeded') {
+            return self::FAILURE_QUOTA_EXCEEDED;
+        }
+
+        // "rate_limited" (api key guard) and "too many requests" (rate limiter)
+        // are the same thing to the caller: wait a moment and it passes.
+        return self::FAILURE_RATE_LIMITED;
     }
 
     // ---------------------------------------------------------------------
@@ -439,5 +577,26 @@ final class Client
             return 'https';
         }
         return '';
+    }
+
+    /**
+     * Best-effort URL of the page verify() is being called for, from $_SERVER.
+     * Returns '' when it cannot be built (e.g. CLI) — the caller then simply
+     * sends no page. Capped so a crafted request cannot bloat the payload; the
+     * service caps again on its side.
+     */
+    private function currentPageUrl(): string
+    {
+        $server = $_SERVER ?? [];
+        $host = (string) ($server['HTTP_HOST'] ?? '');
+        $uri  = (string) ($server['REQUEST_URI'] ?? '');
+        if ($host === '' || $uri === '') {
+            return '';
+        }
+        $scheme = $this->detectScheme($server);
+        if ($scheme === '') {
+            $scheme = 'https';
+        }
+        return substr($scheme . '://' . $host . $uri, 0, 1024);
     }
 }

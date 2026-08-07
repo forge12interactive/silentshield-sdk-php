@@ -1,22 +1,41 @@
 # SilentShield PHP SDK
 
-One dependency-free PHP package that bundles **both** of SilentShield's request-time capabilities:
+One dependency-free PHP package that bundles SilentShield's request-time capabilities:
 
 1. **Verify** — confirm a form submission came from a real human (call on submit).
 2. **Observe** — fire-and-forget telemetry about AI-agent / bot traffic (call once at bootstrap on every request).
+3. **Enforce** — actually block disallowed AI bots per your dashboard policy (403/429).
 
-Requires **PHP 8.1+** and `ext-curl`. No third-party dependencies.
+Requires **PHP 8.1+**, `ext-curl` and `ext-sodium` (the last two ship with PHP core). No third-party dependencies.
 
 ## Install
 
+The package is distributed from its GitHub repo (not Packagist). Add the repo as
+a Composer source once, then require it by name:
+
 ```bash
-composer require silentshield/sdk
+composer config repositories.silentshield vcs https://github.com/forge12interactive/silentshield-sdk-php
+composer require forge12interactive/silentshield-sdk
 ```
 
-Or, if you prefer no autoloader, just `require` the single source file:
+Or add it to your `composer.json` directly:
+
+```json
+{
+  "repositories": [
+    { "type": "vcs", "url": "https://github.com/forge12interactive/silentshield-sdk-php" }
+  ],
+  "require": {
+    "forge12interactive/silentshield-sdk": "^1.0"
+  }
+}
+```
+
+Or, if you prefer no autoloader, just `require` the single source file(s):
 
 ```php
-require '/path/to/silentshield/sdk/src/Client.php';
+require '/path/to/silentshield-sdk-php/src/Client.php';
+require '/path/to/silentshield-sdk-php/src/Enforcer.php';
 ```
 
 ## Usage — one package, both jobs
@@ -46,13 +65,19 @@ $client->observe(); // reads from $_SERVER; safe to call on every request
 ### 2. Verify on form submit
 
 Collect the SilentShield nonce from your form and verify it when the form is
-submitted. `verify()` returns `true` **only** for a confident human
-(`ok === true && verdict === "human" && confidence >= 0.7`). It is
-**fail-secure**: any API/transport error returns `false`.
+submitted. `verify()` returns `true` **only** for a human verdict
+(`ok === true && verdict === "human"`) — the verdict already reflects the bot
+threshold you configured in your dashboard. It is **fail-secure**: any
+API/transport error returns `false`.
+
+The field is named **`behavior_nonce`** — that is what the widget injects into
+your form. (Earlier versions of this README said `silentshield_nonce`; that
+field is never set, so following it meant verifying an empty string and
+rejecting every submission.)
 
 ```php
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $nonce = $_POST['silentshield_nonce'] ?? '';
+    $nonce = $_POST['behavior_nonce'] ?? '';
 
     if ($client->verify($nonce)) {
         // Human — process the submission.
@@ -63,6 +88,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ```
+
+#### Why `false` is not always "bot"
+
+`verify()` is fail-secure, so it also returns `false` when we could not answer
+at all. One of those cases deserves its own handling: **your monthly quota is
+used up.** The service then answers `429 quota_exceeded`, and until the 1st of
+next month every real visitor would be turned away as a bot — on a site whose
+owner sees nothing but "verification failed" and reasonably blames the bot
+detection.
+
+`lastFailure()` tells you which case you are in:
+
+```php
+if (!$client->verify($nonce)) {
+    if ($client->lastFailure() === Client::FAILURE_QUOTA_EXCEEDED) {
+        // OUR billing state, not this visitor's fault. Fall back to your own
+        // checks (honeypot, timing, rate limit) instead of rejecting humans
+        // for the rest of the month — and top up the plan.
+        error_log('SilentShield quota exhausted; resets in '
+            . ($client->lastRetryAfter() ?? 0) . 's');
+        // …your own decision here…
+    } else {
+        http_response_code(403);
+        exit('Verification failed.');
+    }
+}
+```
+
+| `lastFailure()` | Meaning | Suggested handling |
+|---|---|---|
+| `FAILURE_BOT` | The service assessed the visitor and said no | Reject — this is the case you configured |
+| `FAILURE_QUOTA_EXCEEDED` | Monthly quota used up (429). Lasts until the 1st | Fall back to your own checks; upgrade |
+| `FAILURE_RATE_LIMITED` | Too many requests right now (429). Over in seconds | Reject or retry |
+| `FAILURE_TRANSPORT` | No answer at all (network, timeout) | Your call — reject is the safe default |
+| `FAILURE_HTTP` / `FAILURE_MALFORMED` | Any other non-2xx / unreadable answer | Reject, and check your key |
 
 ### Options
 
@@ -137,14 +197,6 @@ Requirements: `ext-sodium` + `ext-curl` (both in PHP 8.1 core). For a real block
 the bundle is `monitor` → nothing blocks). Bots are *verified* only when their
 source IP is in the operator's published range; behind a reverse proxy, restore
 the real client IP into `$_SERVER['REMOTE_ADDR']`.
-
-### Block reporting
-
-When the enforcer blocks a request it fire-and-forgets a report to SilentShield
-(after `fastcgi_finish_request`, so it never delays the response) so the
-dashboard's **blocked-bots report** has data. Only blocks are reported. It is on
-by default; pass `['disable_block_reports' => true]` to the constructor to stay
-silent (or `['report_url' => '…']` to override the endpoint).
 
 > Using **WordPress**? The SilentShield plugin ships this enforcer built-in from
 > v2.9.0 — enable it under Advanced → "Block AI crawlers (enforce)". No code.
