@@ -23,7 +23,15 @@ final class Client
      * Base URL for the verify endpoint's host. The full paths are hard-coded
      * per the API contract (verify lives under /v1, telemetry under /api/v1).
      */
+    // Die eigene Version, als Kopfzeile bei jedem Ruf mitgeschickt.
+    //
+    // 🔴 Sie ist die Voraussetzung dafuer, dass das Dashboard einem Kunden
+    // sagen kann „Ihre Einbindung ist veraltet". Ohne sie sieht der Dienst nur
+    // Anfragen, aber nie, WOMIT sie gestellt wurden.
+    public const VERSION = '1.3.0';
+
     private const VERIFY_URL         = 'https://api.silentshield.io/v1/verify';
+    private const REPORT_BLOCK_URL   = 'https://api.silentshield.io/api/v1/captcha/report-block';
     private const TELEMETRY_URL      = 'https://api.silentshield.io/api/v1/agent/telemetry';
     private const BOT_DIRECTORY_URL  = 'https://api.silentshield.io/api/v1/agent/bot-directory';
 
@@ -179,6 +187,10 @@ final class Client
                 'Content-Type: application/json',
                 'Accept: application/json',
                 'api-key: ' . $this->apiKey,
+                // Auch HIER, nicht nur bei reportBlock: verify ist der Ruf, den jede
+                // Formularabsendung macht — wer ihn allein nutzt, meldete sonst nie,
+                // womit er arbeitet.
+                'X-SS-SDK: php/' . self::VERSION,
             ],
             CURLOPT_SSL_VERIFYPEER => !$this->insecure,
             CURLOPT_SSL_VERIFYHOST => $this->insecure ? 0 : 2,
@@ -428,6 +440,7 @@ final class Client
                 CURLOPT_HTTPHEADER     => [
                     'Content-Type: application/json',
                     'x-api-key: ' . $this->apiKey,
+                    'X-SS-SDK: php/' . self::VERSION,
                 ],
                 CURLOPT_SSL_VERIFYPEER => !$this->insecure,
                 CURLOPT_SSL_VERIFYHOST => $this->insecure ? 0 : 2,
@@ -585,6 +598,97 @@ final class Client
      * sends no page. Capped so a crafted request cannot bloat the payload; the
      * service caps again on its side.
      */
+    // ── Vorab abgewehrt: was IHR Code blockt, bevor wir gefragt werden ──────
+    //
+    // 🔴 Diese Sperren sind fuer SilentShield sonst UNSICHTBAR. Ein Bot ohne
+    // JavaScript laedt das Widget nie, sendet nie Telemetrie und taucht in
+    // keiner Statistik auf — obwohl er abgewehrt wurde. `reportBlock()` macht
+    // ihn sichtbar: er zaehlt in „Bots geblockt", verbraucht aber KEIN
+    // Kontingent.
+    //
+    // Gemessen auf einer echten Kundenseite (08.09.2026): 6.079 solcher
+    // Sperren in sieben Tagen gegen 2 Absendungen, die uns ueberhaupt
+    // erreichten. Wer sie nicht meldet, verschenkt den Nachweis seines
+    // eigenen Schutzes.
+    public const BLOCK_NO_NONCE           = 'no_nonce';
+    public const BLOCK_JAVASCRIPT_MISSING = 'javascript_missing';
+    public const BLOCK_TOO_FAST           = 'too_fast';
+    public const BLOCK_TOKEN_MISSING      = 'token_missing';
+    public const BLOCK_TOKEN_UNKNOWN      = 'token_unknown';
+    public const BLOCK_TOKEN_REUSED       = 'token_reused';
+    public const BLOCK_GIBBERISH          = 'gibberish';
+    public const BLOCK_IP_BLACKLISTED     = 'ip_blacklisted';
+    public const BLOCK_BROWSER_CHECK      = 'browser_check';
+    public const BLOCK_CAPTCHA_FAILED     = 'captcha_failed';
+    public const BLOCK_HONEYPOT           = 'honeypot';
+    public const BLOCK_RATE_LIMITED       = 'rate_limited';
+    public const BLOCK_CUSTOM_RULE        = 'custom_rule';
+
+    /**
+     * Meldet eine Absendung, die IHR Code selbst abgewiesen hat.
+     *
+     * 🔴 NUR fuer Sperren, die unseren Server NIE erreicht haben.
+     *
+     * Wenn Sie `verify()` gefragt haben und die Antwort „nicht menschlich"
+     * lautete, ist die Absendung bei uns bereits verzeichnet — eine Meldung
+     * darueber wuerde dieselbe Absendung ein ZWEITES Mal zaehlen. Dasselbe
+     * gilt, wenn `verify()` nur wegen eines Transportfehlers scheiterte: die
+     * Telemetrie kann uns trotzdem erreicht haben.
+     *
+     * Faustregel: melden, was gar nicht erst zu uns gelangt ist.
+     *
+     * Der Aufruf ist ohne Rueckmeldung und ohne Wirkung auf Ihren Ablauf:
+     * die Sperre ist bei Ihnen bereits erfolgt, und ein Fehler hier darf
+     * daran nichts aendern. Deshalb gibt es keinen Rueckgabewert.
+     *
+     * @param string $reason  Einer der BLOCK_*-Werte. Unbekanntes nimmt der
+     *                        Dienst an, verbucht es aber als „EXTERNAL_BLOCK"
+     *                        und verliert damit die Aussage.
+     * @param string $formKey Optionale Kennung des Formulars, damit der Kunde
+     *                        sieht, WELCHES angegriffen wird.
+     * @param string|null $pageUrl Ueberschreibt die selbst ermittelte Adresse.
+     */
+    public function reportBlock(string $reason, string $formKey = '', ?string $pageUrl = null): void
+    {
+        $body = ['reason' => $reason];
+
+        $page = $pageUrl ?? $this->currentPageUrl();
+        if ($page !== '') {
+            $body['page_url'] = substr($page, 0, 1024);
+        }
+        if ($formKey !== '') {
+            $body['form_key'] = substr($formKey, 0, 64);
+        }
+
+        $payload = json_encode($body, JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
+            return; // Encoding gescheitert — die Sperre steht trotzdem.
+        }
+
+        $ch = curl_init(self::REPORT_BLOCK_URL);
+        if ($ch === false) {
+            return;
+        }
+
+        // ⚠️ Kurzes Zeitlimit. Diese Meldung darf die Antwort an den Besucher
+        // niemals verzoegern; sie ist Beiwerk, die Sperre ist die Zusage.
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 2,
+            CURLOPT_CONNECTTIMEOUT => 1,
+            CURLOPT_HTTPHEADER     => [
+                'Content-Type: application/json',
+                'api-key: ' . $this->apiKey,
+                'X-SS-SDK: php/' . self::VERSION,
+            ],
+        ]);
+
+        curl_exec($ch);
+        curl_close($ch);
+    }
+
     private function currentPageUrl(): string
     {
         $server = $_SERVER ?? [];

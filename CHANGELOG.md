@@ -3,6 +3,39 @@
 All notable changes to `forge12interactive/silentshield-sdk`.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-09-09
+
+### Added
+
+**`Client::reportBlock()` — melden, was Ihr eigener Code abweist.**
+
+Sperren, die Sie selbst vornehmen, bevor SilentShield gefragt wird, sind für den
+Dienst bisher **unsichtbar**: ein Bot ohne JavaScript lädt das Widget nie, sendet
+nie Telemetrie und taucht in keiner Statistik auf — obwohl er abgewehrt wurde.
+Auf einer echten Kundenseite gemessen (08.09.2026): 6.079 solcher Sperren in
+sieben Tagen gegen 2 Absendungen, die den Dienst überhaupt erreichten.
+
+Gemeldete Sperren zählen in „Bots geblockt" und verbrauchen **kein Kontingent**.
+
+Dreizehn Gründe stehen als Konstanten bereit (`Client::BLOCK_HONEYPOT` …): `no_nonce`,
+`javascript_missing`, `too_fast`, `token_missing`, `token_unknown`,
+`token_reused`, `gibberish`, `ip_blacklisted`, `browser_check`,
+`captcha_failed`, `honeypot`, `rate_limited`, `custom_rule`.
+
+🔴 **Nur für Sperren, die den Dienst nie erreicht haben.** Wenn `verify` gefragt
+wurde und „nicht menschlich" antwortete, ist die Absendung dort bereits
+verzeichnet — eine zusätzliche Meldung zählte dieselbe Absendung ein zweites Mal.
+Genau deshalb gibt es für diesen Fall **keine** Konstante: was doppelt zählen
+würde, lässt sich mit dieser Schnittstelle gar nicht erst melden.
+
+Die Meldung beeinflusst Ihren Ablauf nicht. Die Sperre ist bei Ihnen bereits
+erfolgt, und ein Fehler beim Melden darf daran nichts ändern.
+
+**Die eigene Version wandert als `X-SS-SDK`-Kopfzeile mit** — bei `verify()`,
+`observe()` und `reportBlock()`. Ohne sie sieht der Dienst nur Anfragen, aber
+nie, womit sie gestellt wurden, und kann Ihnen deshalb auch nicht sagen, wenn
+Ihre Einbindung veraltet ist.
+
 ## [1.2.0] — 2026-08-07
 
 Two of these are corrections to behaviour that turned real visitors away. If you

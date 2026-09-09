@@ -147,6 +147,52 @@ check(
     (new Client('k'))->lastRetryAfter()
 );
 
+
+// ── reportBlock: was IHR Code abweist, bevor SilentShield gefragt wird ──────
+//
+// 🔴 Diese Sperren sind sonst unsichtbar: ein Bot ohne JavaScript laedt das
+// Widget nie und taucht in keiner Statistik auf, obwohl er abgewehrt wurde.
+//
+// ⚠️ Der Ruf selbst geht ueber curl und ist ohne Netz nicht pruefbar. Geprueft
+// wird deshalb, was ohne Netz pruefbar ist und trotzdem brechen kann: das
+// Vokabular und die Version.
+
+$blockKonstanten = array_filter(
+    (new ReflectionClass(Client::class))->getConstants(),
+    static fn (string $name) => str_starts_with($name, 'BLOCK_'),
+    ARRAY_FILTER_USE_KEY
+);
+
+check(
+    'reportBlock: das Vokabular deckt alle 13 Sperrgruende ab',
+    13,
+    count($blockKonstanten)
+);
+
+check(
+    'reportBlock: no_nonce heisst weiterhin no_nonce',
+    'no_nonce',
+    Client::BLOCK_NO_NONCE
+);
+
+// Alle Gruende sind kleingeschrieben mit Unterstrichen — der Dienst gleicht
+// ohne Normalisierung gegen seine Whitelist ab, ein Tippfehler faellt still
+// auf "EXTERNAL_BLOCK".
+check(
+    'reportBlock: alle Gruende sind in der Schreibweise der Whitelist',
+    true,
+    count(array_filter($blockKonstanten, static fn ($v) => (bool) preg_match('/^[a-z_]+$/', (string) $v)))
+        === count($blockKonstanten)
+);
+
+// Die Version wandert als Kopfzeile mit — ohne sie kann das Dashboard nicht
+// sagen, dass eine Einbindung veraltet ist.
+check(
+    'die eigene Version ist gesetzt',
+    1,
+    preg_match('/^\d+\.\d+\.\d+$/', Client::VERSION)
+);
+
 echo "\n";
 if ($failures > 0) {
     echo "RESULT: {$failures} test(s) FAILED\n";
