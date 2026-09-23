@@ -28,7 +28,7 @@ final class Client
     // 🔴 Sie ist die Voraussetzung dafuer, dass das Dashboard einem Kunden
     // sagen kann „Ihre Einbindung ist veraltet". Ohne sie sieht der Dienst nur
     // Anfragen, aber nie, WOMIT sie gestellt wurden.
-    public const VERSION = '1.3.0';
+    public const VERSION = '1.4.0';
 
     private const VERIFY_URL         = 'https://api.silentshield.io/v1/verify';
     private const REPORT_BLOCK_URL   = 'https://api.silentshield.io/api/v1/captcha/report-block';

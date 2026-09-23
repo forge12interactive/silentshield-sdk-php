@@ -196,7 +196,29 @@ Requirements: `ext-sodium` + `ext-curl` (both in PHP 8.1 core). For a real block
 `agent_gateway_enforce` must be enabled and a Block rule set on the key (otherwise
 the bundle is `monitor` → nothing blocks). Bots are *verified* only when their
 source IP is in the operator's published range; behind a reverse proxy, restore
-the real client IP into `$_SERVER['REMOTE_ADDR']`.
+the real client IP into `$_SERVER['REMOTE_ADDR']` or set `trusted_proxies`
+(below).
+
+### Spoofed agents (`spoof` rules)
+
+A `spoof` rule blocks requests whose User-Agent claims an agent (e.g. Googlebot)
+while the source IP lies outside every range the operator publishes for that
+address family. It needs the **visitor's** address — behind a reverse proxy
+`REMOTE_ADDR` is the proxy, and a spoof rule would block the genuine Googlebot.
+So the verdict is **off** until you say where the address comes from:
+
+```php
+// Behind your own reverse proxies (CIDRs or IPs): X-Forwarded-For is read from
+// the right, only when REMOTE_ADDR is one of them.
+$enf = new \SilentShield\Enforcer('YOUR_SITE_KEY', ['trusted_proxies' => ['10.0.0.0/8']]);
+// …or: nothing in front of PHP, REMOTE_ADDR is the visitor.
+$enf = new \SilentShield\Enforcer('YOUR_SITE_KEY', ['direct_connection' => true]);
+```
+
+With either option the same address also decides *verified*, and the enforcer
+tells the dashboard it supports spoof rules (`caps=behaviors,spoof`). Without
+one it never calls a request spoof and declares `caps=behaviors` — the dashboard
+then shows spoof rules as not supported by this installation.
 
 > Using **WordPress**? The SilentShield plugin ships this enforcer built-in from
 > v2.9.0 — enable it under Advanced → "Block AI crawlers (enforce)". No code.

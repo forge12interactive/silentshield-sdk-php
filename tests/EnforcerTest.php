@@ -9,6 +9,7 @@ declare(strict_types=1);
  * Run: php tests/EnforcerTest.php
  */
 
+require __DIR__ . '/../src/Client.php';
 require __DIR__ . '/../src/Enforcer.php';
 
 use SilentShield\Enforcer;
@@ -82,6 +83,96 @@ check('match any', true, priv($enf, 'matchApplies', [['type' => 'any'], '', '', 
 check('match unsigned', true, priv($enf, 'matchApplies', [['type' => 'unsigned'], '', '', false]));
 check('match unsigned (verified) false', false, priv($enf, 'matchApplies', [['type' => 'unsigned'], '', '', true]));
 check('match bogus false', false, priv($enf, 'matchApplies', [['type' => 'bogus'], 'x', 'y', false]));
+
+// --- behaviours (plan/131 E35) ---
+// The server ships each agent's behaviour set; an agent_category rule hits the
+// category OR any behaviour (api/core/agentpolicy/policy.go matchApplies).
+// Before this, "block training" never reached Googlebot (category search,
+// behaves as training) — the rule showed as active and blocked nothing.
+$trainRule = [['match' => ['type' => 'agent_category', 'value' => 'training'], 'action' => 'deny']];
+check('behaviour hit blocks despite other category', 'deny',
+    priv($enf, 'evaluate', [$trainRule, 'googlebot', 'search', false, '/', 'GET', ['search', 'training']])['action'] ?? null);
+check('category hit still blocks', 'deny',
+    priv($enf, 'evaluate', [$trainRule, 'gptbot', 'training', false, '/', 'GET', []])['action'] ?? null);
+check('neither category nor behaviour: no match', null,
+    priv($enf, 'evaluate', [$trainRule, 'bingbot', 'search', false, '/', 'GET', ['search']]));
+check('behaviour compare is exact (case-sensitive, like the server)', false,
+    priv($enf, 'matchApplies', [['type' => 'agent_category', 'value' => 'training'], 'x', 'search', false, ['Training']]));
+
+// identify carries the behaviours from the bundle alongside the category.
+$bBundle = ['agents' => [[
+    'slug' => 'googlebot', 'category' => 'search', 'behaviors' => ['search', 'training'],
+    'ua_tokens' => ['Googlebot'], 'cidrs' => [],
+]]];
+[$bSlug, $bCat, $bVerified, $bBehaviors] = priv($enf, 'identify', ['Mozilla/5.0 (compatible; Googlebot/2.1)', $bBundle, ['REMOTE_ADDR' => '1.2.3.4']]);
+check('identify carries behaviours', ['search', 'training'], $bBehaviors);
+check('identify + evaluate blocks via behaviour', 'deny',
+    priv($enf, 'evaluate', [$trainRule, $bSlug, $bCat, $bVerified, '/', 'GET', $bBehaviors])['action'] ?? null);
+
+// --- spoof verdict (decision 23.09.2026) ---
+// A UA claiming an agent whose operator publishes ranges for the source's
+// address family, from outside all of them, is refuted — as goagent in the
+// server. What cannot be checked (other family, no ranges, an address that may
+// be a proxy's) is never spoof.
+$spoofRule = [['match' => ['type' => 'spoof'], 'action' => 'deny']];
+$gbUA      = 'Mozilla/5.0 (compatible; Googlebot/2.1)';
+$direct    = new Enforcer('test-key', ['direct_connection' => true]);
+$proxied   = new Enforcer('test-key', ['trusted_proxies' => ['10.0.0.0/8', '192.0.2.7']]);
+$spoofCase = function (Enforcer $e, array $cidrs, string $ip, string $xff = '') use ($spoofRule, $gbUA) {
+    $sb     = ['agents' => [['slug' => 'googlebot', 'category' => 'search', 'ua_tokens' => ['Googlebot'], 'cidrs' => $cidrs]]];
+    $server = ['REMOTE_ADDR' => $ip];
+    if ($xff !== '') {
+        $server['HTTP_X_FORWARDED_FOR'] = $xff;
+    }
+    [$s, $c, $v, $bh, $sp] = priv($e, 'identify', [$gbUA, $sb, $server]);
+    $rule = priv($e, 'evaluate', [$spoofRule, $s, $c, $v, '/', 'GET', $bh, $sp]);
+    return [$v, $sp, $rule['action'] ?? null];
+};
+$v4 = ['66.249.64.0/19'];
+check('spoof (direct): IPv4 ranges, source outside → deny', [false, true, 'deny'], $spoofCase($direct, $v4, '203.0.113.7'));
+check('spoof (direct): IPv4 ranges, source inside → verified, no spoof', [true, false, null], $spoofCase($direct, $v4, '66.249.66.1'));
+check('spoof (direct): only IPv4 ranges, IPv6 source → no spoof', [false, false, null], $spoofCase($direct, $v4, '2001:db8::1'));
+check('spoof (direct): no ranges → no spoof', [false, false, null], $spoofCase($direct, [], '203.0.113.7'));
+check('spoof (direct): IPv6 ranges, IPv6 source outside → deny', [false, true, 'deny'], $spoofCase($direct, ['2001:4860:4801::/48'], '2001:db8::1'));
+check('spoof (direct): IPv4-mapped peer inside IPv4 range → verified', [true, false, null], $spoofCase($direct, ['66.249.64.0/19', '2001:4860:4801::/48'], '::ffff:66.249.66.1'));
+check('spoof (direct): no address → no spoof', [false, false, null], $spoofCase($direct, $v4, ''));
+check('match spoof false when not refuted', false, priv($enf, 'matchApplies', [['type' => 'spoof'], 'x', 'y', false, [], false]));
+
+// Without trusted_proxies/direct_connection REMOTE_ADDR may be a proxy: never
+// spoof (a spoof rule would block the genuine Googlebot behind every proxy).
+check('spoof (no option): source outside → no spoof, no block', [false, false, null], $spoofCase($enf, $v4, '203.0.113.7'));
+check('spoof (no option): XFF still ignored for verified', [false, false, null], $spoofCase($enf, $v4, '203.0.113.7', '66.249.66.1'));
+check('spoof (all-garbage trusted_proxies) = not configured', [false, false, null],
+    $spoofCase(new Enforcer('test-key', ['trusted_proxies' => 'kaputt']), $v4, '203.0.113.7'));
+
+// trusted_proxies: clientIP as in the server — XFF from the right, only behind
+// a trusted peer.
+check('proxied: rightmost untrusted hop outside → deny', [false, true, 'deny'],
+    $spoofCase($proxied, $v4, '10.0.0.5', '66.249.66.1, 203.0.113.7, 192.0.2.7'));
+check('proxied: rightmost untrusted hop inside → verified', [true, false, null],
+    $spoofCase($proxied, $v4, '10.0.0.5', '203.0.113.7, 66.249.66.1'));
+check('proxied: forged left XFF entry changes nothing', [false, true, 'deny'],
+    $spoofCase($proxied, $v4, '10.0.0.5', '66.249.66.1, 203.0.113.7'));
+check('proxied: untrusted peer with XFF → peer counts (outside)', [false, true, 'deny'],
+    $spoofCase($proxied, $v4, '203.0.113.7', '66.249.66.1'));
+check('proxied: untrusted peer with XFF → peer counts (inside)', [true, false, null],
+    $spoofCase($proxied, $v4, '66.249.66.1', '203.0.113.7'));
+check('proxied: garbage stops the walk → peer', '10.0.0.5', priv($proxied, 'clientIp', ['10.0.0.5', '203.0.113.9, kaputt']));
+check('proxied: comma-string option works too', '203.0.113.7',
+    priv(new Enforcer('test-key', ['trusted_proxies' => '10.0.0.0/8, 192.0.2.7']), 'clientIp', ['10.0.0.5', '66.249.66.1, 203.0.113.7, 192.0.2.7']));
+
+// --- enforcer self-identification on the bundle fetch (plan/79 Inc4) ---
+// Without the header the dashboard cannot tell whether this installation
+// carries out behaviour and spoof rules. spoof only with a trustworthy visitor
+// address. Sorted like FormatEnforcerID.
+$ph = priv($enf, 'policyHeaders', []);
+check('policy fetch sends the api key', true, in_array('x-api-key: test-key', $ph, true));
+check('policy fetch declares the enforcer (no option: no spoof)', true,
+    in_array('X-SilentShield-Enforcer: sdk-php/' . \SilentShield\Client::VERSION . ' caps=behaviors', $ph, true));
+check('policy fetch declares spoof with direct_connection', true,
+    in_array('X-SilentShield-Enforcer: sdk-php/' . \SilentShield\Client::VERSION . ' caps=behaviors,spoof', priv($direct, 'policyHeaders', []), true));
+check('policy fetch declares spoof with trusted_proxies', true,
+    in_array('X-SilentShield-Enforcer: sdk-php/' . \SilentShield\Client::VERSION . ' caps=behaviors,spoof', priv($proxied, 'policyHeaders', []), true));
 
 // --- path / method matchers ---
 check('path * matches', true, priv($enf, 'pathMatches', ['*', '/anything']));

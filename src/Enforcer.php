@@ -42,6 +42,21 @@ final class Enforcer
     /** Pinned-keys cache lifetime (seconds). */
     private const KEYS_TTL = 3600;
 
+    /**
+     * What this enforcer tells the server on every bundle fetch (plan/79 Inc4,
+     * plan/131 E35), as `X-SilentShield-Enforcer: sdk-php/<version> caps=…`.
+     *
+     * The capability list is a statement about what THIS code carries out, so it
+     * changes in the same commit as the matching code: `behaviors` because
+     * agent_category is matched against the behaviour set (matchApplies).
+     * `spoof` is appended (policyHeaders) ONLY with trusted_proxies or
+     * direct_connection — without a trustworthy visitor address no spoof
+     * verdict is computed, and declaring it would let the dashboard report a
+     * spoof rule as in force. Sorted like FormatEnforcerID in the server.
+     */
+    private const ENFORCER_KIND = 'sdk-php';
+    private const ENFORCER_CAPS = 'behaviors';
+
     private string $apiKey;
     private string $policyUrl;
     private string $keysUrl;
@@ -50,11 +65,24 @@ final class Enforcer
     private int $timeout;
     private bool $insecure;
     private string $cacheDir;
+    /** @var array<int,string> trusted_proxies as parsed CIDRs */
+    private array $trustedProxies;
+    private bool $directConnection;
 
     /**
      * @param string               $apiKey Publishable, domain-bound site key.
      * @param array<string,mixed>  $opts   policy_url, keys_url, report_url, timeout,
-     *                                     insecure, cache_dir, disable_block_reports
+     *                                     insecure, cache_dir, disable_block_reports,
+     *                                     trusted_proxies, direct_connection
+     *
+     * trusted_proxies (CIDRs or IPs of YOUR reverse proxies): when REMOTE_ADDR
+     * is one of them, X-Forwarded-For is read from the right and the first
+     * address that is not a trusted proxy is the visitor — as in the
+     * SilentShield server. direct_connection (bool): REMOTE_ADDR IS the visitor.
+     * Either switches on the `spoof` verdict; without them the enforcer cannot
+     * tell a visitor's address from a proxy's and never calls a request spoof
+     * (a spoof rule would otherwise block the genuine Googlebot behind every
+     * proxy).
      */
     public function __construct(string $apiKey, array $opts = [])
     {
@@ -65,6 +93,9 @@ final class Enforcer
         $this->timeout   = (int) ($opts['timeout']       ?? 5);
         $this->insecure  = (bool) ($opts['insecure']     ?? false);
         $this->cacheDir  = rtrim((string) ($opts['cache_dir'] ?? sys_get_temp_dir()), '/\\');
+        // An all-garbage list counts as not configured: spoof stays off.
+        $this->trustedProxies   = self::parseTrustedProxies($opts['trusted_proxies'] ?? []);
+        $this->directConnection = !empty($opts['direct_connection']);
         // plan/65: report deny/throttle blocks to the telemetry endpoint so the
         // dashboard's "blocked bots" report has data. On by default (only blocks
         // are reported — a rare event); set disable_block_reports to silence it.
@@ -159,8 +190,8 @@ final class Enforcer
             $method = isset($server['REQUEST_METHOD']) ? strtoupper((string) $server['REQUEST_METHOD']) : 'GET';
             $path   = $this->requestPath($server);
 
-            [$slug, $category, $verified] = $this->identify($ua, $bundle, $server);
-            $rule = $this->evaluate(\is_array($bundle['rules'] ?? null) ? $bundle['rules'] : [], $slug, $category, $verified, $path, $method);
+            [$slug, $category, $verified, $behaviors, $spoof] = $this->identify($ua, $bundle, $server);
+            $rule = $this->evaluate(\is_array($bundle['rules'] ?? null) ? $bundle['rules'] : [], $slug, $category, $verified, $path, $method, $behaviors, $spoof);
             if ($rule === null) {
                 return null;
             }
@@ -206,7 +237,7 @@ final class Enforcer
         if ($keys === []) {
             return $cached;
         }
-        $body = $this->httpGet($this->policyUrl, ['x-api-key: ' . $this->apiKey]);
+        $body = $this->httpGet($this->policyUrl, $this->policyHeaders());
         if ($body === null) {
             return $cached;
         }
@@ -216,6 +247,130 @@ final class Enforcer
         }
         @file_put_contents($bundleFile, json_encode($bundle), LOCK_EX);
         return $bundle;
+    }
+
+    /**
+     * Headers for GET /agent/policy. The version comes from Client::VERSION (the
+     * one package version); an installation that required only Enforcer.php
+     * still declares its kind and capabilities, just without a version.
+     *
+     * @return array<int,string>
+     */
+    private function policyHeaders(): array
+    {
+        $version = \class_exists(Client::class) ? Client::VERSION : '';
+        $caps    = self::ENFORCER_CAPS . ($this->spoofCapable() ? ',spoof' : '');
+        $id      = self::ENFORCER_KIND . ($version !== '' ? '/' . $version : '') . ' caps=' . $caps;
+        return ['x-api-key: ' . $this->apiKey, 'X-SilentShield-Enforcer: ' . $id];
+    }
+
+    /** The enforcer knows where the visitor's address comes from. */
+    private function spoofCapable(): bool
+    {
+        return $this->trustedProxies !== [] || $this->directConnection;
+    }
+
+    /**
+     * The address to judge a request by, and whether it is trustworthy enough
+     * for a spoof verdict. trusted_proxies → clientIP in the server
+     * (X-Forwarded-For from the right, only behind a trusted peer);
+     * direct_connection → REMOTE_ADDR; neither → REMOTE_ADDR as before, not
+     * trustworthy.
+     *
+     * @param array<string,mixed> $server
+     * @return array{0:string,1:bool}
+     */
+    private function visitorIp(array $server): array
+    {
+        $peer = self::normalizeIp(isset($server['REMOTE_ADDR']) ? (string) $server['REMOTE_ADDR'] : '');
+        if ($this->trustedProxies !== []) {
+            $xff = isset($server['HTTP_X_FORWARDED_FOR']) ? (string) $server['HTTP_X_FORWARDED_FOR'] : '';
+            return [$this->clientIp($peer, $xff), true];
+        }
+        return [$peer, $this->directConnection];
+    }
+
+    /**
+     * Mirrors clientIP in the server's goagent enforcer. The rule is a security
+     * boundary: an untrusted peer is the visitor and its X-Forwarded-For is
+     * ignored; behind a trusted peer the chain is walked from the right (entries
+     * our own proxies appended) and the first address that is not a trusted
+     * proxy wins. Garbage stops the walk rather than stepping past it into
+     * entries the sender fully controls.
+     */
+    private function clientIp(string $peer, string $xff): string
+    {
+        if ($this->trustedProxies === [] || !$this->isTrustedProxy($peer)) {
+            return $peer;
+        }
+        $parts = explode(',', $xff);
+        for ($i = \count($parts) - 1; $i >= 0; $i--) {
+            $candidate = self::normalizeIp(trim($parts[$i]));
+            if ($candidate === '') {
+                continue;
+            }
+            if (@inet_pton($candidate) === false) {
+                break;
+            }
+            if (!$this->isTrustedProxy($candidate)) {
+                return $candidate;
+            }
+        }
+        // Only trusted hops (or no header): the peer is the closest thing to a
+        // client address we have.
+        return $peer;
+    }
+
+    private function isTrustedProxy(string $ip): bool
+    {
+        foreach ($this->trustedProxies as $cidr) {
+            if ($this->ipInCidr($ip, $cidr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * An IPv4 address in IPv6 notation (::ffff:a.b.c.d, as dual-stack servers
+     * deliver it) is IPv4 — as net.IP.To4 in the server treats it. Otherwise a
+     * genuine bot would miss its IPv4 range and fall into the IPv6 family check.
+     */
+    private static function normalizeIp(string $ip): string
+    {
+        return (string) preg_replace('/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i', '', $ip);
+    }
+
+    /**
+     * trusted_proxies as CIDRs; bare IPs are widened to /32 or /128, entries
+     * that do not parse are dropped (as TrustedProxies in the server).
+     *
+     * @param mixed $raw array of strings or a comma-separated string
+     * @return array<int,string>
+     */
+    private static function parseTrustedProxies($raw): array
+    {
+        $entries = \is_array($raw) ? $raw : (\is_string($raw) ? explode(',', $raw) : []);
+        $out = [];
+        foreach ($entries as $entry) {
+            $entry = trim((string) $entry);
+            if ($entry === '') {
+                continue;
+            }
+            if (!str_contains($entry, '/')) {
+                $bin = @inet_pton($entry);
+                if ($bin !== false) {
+                    $out[] = $entry . '/' . (\strlen($bin) === 4 ? '32' : '128');
+                }
+                continue;
+            }
+            [$subnet, $bits] = explode('/', $entry, 2);
+            $bin = @inet_pton($subnet);
+            if ($bin !== false && ctype_digit($bits) && (int) $bits <= \strlen($bin) * 8) {
+                $out[] = $entry;
+            }
+        }
+        return $out;
     }
 
     /** @return array<string,string> kid => raw 32-byte public key */
@@ -300,13 +455,20 @@ final class Enforcer
     /**
      * @param array<string,mixed>      $bundle
      * @param array<string,mixed>      $server
-     * @return array{0:string,1:string,2:bool} [slug, category, verified]
+     * @return array{0:string,1:string,2:bool,3:array<int,string>,4:bool} [slug, category, verified, behaviors, spoof]
+     *
+     * behaviors is the agent's multi-valued behaviour set from the bundle
+     * (plan/79 Inc2). It travels with the category: a rule "block training"
+     * must also catch a bot filed under another category that trains. The
+     * server strips the field while its rollout gate is closed; then it is
+     * simply empty and matching falls back to the category alone.
      */
     private function identify(string $ua, array $bundle, array $server): array
     {
         $uaLc = strtolower($ua);
         $slug = '';
         $cat  = '';
+        $behaviors = [];
         $best = 0;
         $matchedCidrs = [];
         foreach (\is_array($bundle['agents'] ?? null) ? $bundle['agents'] : [] as $a) {
@@ -316,34 +478,45 @@ final class Enforcer
                     $best         = \strlen($tl);
                     $slug         = (string) ($a['slug'] ?? '');
                     $cat          = (string) ($a['category'] ?? '');
+                    $behaviors    = \is_array($a['behaviors'] ?? null) ? array_values(array_map('strval', $a['behaviors'])) : [];
                     $matchedCidrs = \is_array($a['cidrs'] ?? null) ? $a['cidrs'] : [];
                 }
             }
         }
         $verified = false;
+        $spoof    = false;
         if ($slug !== '' && $matchedCidrs !== []) {
-            $ip = isset($server['REMOTE_ADDR']) ? (string) $server['REMOTE_ADDR'] : '';
+            [$ip, $trustworthy] = $this->visitorIp($server);
             foreach ($matchedCidrs as $cidr) {
                 if ($this->ipInCidr($ip, (string) $cidr)) {
                     $verified = true;
                     break;
                 }
             }
+            // Definitively refuted, not merely unconfirmed (as goagent in the
+            // server): the operator publishes ranges FOR THIS ADDRESS FAMILY and
+            // the source is outside all of them, so the UA is a lie. Without the
+            // family check an IPv6 Googlebot would be accused because only its
+            // IPv4 ranges are known. Anything we cannot check (no ranges, other
+            // family, no parseable address) stays unsigned, never spoof — and an
+            // address that may be a proxy's cannot be checked.
+            $spoof = $trustworthy && !$verified && $this->hasSameFamily($matchedCidrs, $ip);
         }
-        return [$slug, $cat, $verified];
+        return [$slug, $cat, $verified, $behaviors, $spoof];
     }
 
     /**
      * @param array<int,array<string,mixed>> $rules
+     * @param array<int,string>              $behaviors
      * @return array<string,mixed>|null
      */
-    private function evaluate(array $rules, string $slug, string $category, bool $verified, string $path, string $method): ?array
+    private function evaluate(array $rules, string $slug, string $category, bool $verified, string $path, string $method, array $behaviors = [], bool $spoof = false): ?array
     {
         foreach ($rules as $rule) {
             if (!\is_array($rule)) {
                 continue;
             }
-            if (!$this->matchApplies(\is_array($rule['match'] ?? null) ? $rule['match'] : [], $slug, $category, $verified)) {
+            if (!$this->matchApplies(\is_array($rule['match'] ?? null) ? $rule['match'] : [], $slug, $category, $verified, $behaviors, $spoof)) {
                 continue;
             }
             if (!$this->pathMatches((string) ($rule['path_pattern'] ?? ''), $path)) {
@@ -357,16 +530,39 @@ final class Enforcer
         return null;
     }
 
-    /** @param array<string,mixed> $match */
-    private function matchApplies(array $match, string $slug, string $category, bool $verified): bool
+    /**
+     * Mirrors matchApplies in api/core/agentpolicy/policy.go: agent_category hits
+     * the legacy category OR any behaviour of the agent, compared exactly
+     * (case-sensitive, as the server does); spoof hits only a definitively
+     * refuted identity (see identify).
+     *
+     * @param array<string,mixed> $match
+     * @param array<int,string>   $behaviors
+     */
+    private function matchApplies(array $match, string $slug, string $category, bool $verified, array $behaviors = [], bool $spoof = false): bool
     {
         return match ((string) ($match['type'] ?? '')) {
             'any'            => true,
             'agent_slug'     => $slug !== '' && $slug === (string) ($match['value'] ?? ''),
-            'agent_category' => $category !== '' && $category === (string) ($match['value'] ?? ''),
+            'agent_category' => $this->categoryMatches((string) ($match['value'] ?? ''), $category, $behaviors),
             'unsigned'       => !$verified,
+            'spoof'          => $spoof,
             default          => false,
         };
+    }
+
+    /** @param array<int,string> $behaviors */
+    private function categoryMatches(string $value, string $category, array $behaviors): bool
+    {
+        if ($category !== '' && $category === $value) {
+            return true;
+        }
+        foreach ($behaviors as $b) {
+            if ($b !== '' && $b === $value) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function pathMatches(string $pattern, string $path): bool
@@ -520,5 +716,31 @@ final class Enforcer
         }
         $mask = \chr((0xff << (8 - $rem)) & 0xff);
         return (\ord($ipBin[$full]) & \ord($mask)) === (\ord($netBin[$full]) & \ord($mask));
+    }
+
+    /**
+     * Whether any published range belongs to the source IP's address family
+     * (IPv4 vs IPv6) — hasSameFamily in the server's goagent enforcer. Ranges
+     * that do not parse count for neither family, as in the server.
+     *
+     * @param array<int,mixed> $cidrs
+     */
+    private function hasSameFamily(array $cidrs, string $ip): bool
+    {
+        $ipBin = @inet_pton($ip);
+        if ($ipBin === false) {
+            return false;
+        }
+        foreach ($cidrs as $cidr) {
+            $cidr = (string) $cidr;
+            if (!str_contains($cidr, '/')) {
+                continue;
+            }
+            $netBin = @inet_pton(explode('/', $cidr, 2)[0]);
+            if ($netBin !== false && \strlen($netBin) === \strlen($ipBin)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

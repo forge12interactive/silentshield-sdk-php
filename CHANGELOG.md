@@ -3,6 +3,58 @@
 All notable changes to `forge12interactive/silentshield-sdk`.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-09-23
+
+### Fixed
+
+**„KI-Agenten blockieren" wirkt jetzt auch für Agenten, die sich anders
+verhalten, als ihre Kategorie sagt.** Das Policy-Bündel führt je Agent seine
+Verhaltensweisen (`behaviors`), etwa `search` **und** `training` beim
+Googlebot. Eine Regel vom Typ `agent_category` trifft jetzt — genau wie im
+SilentShield-Server —, wenn ihr Wert der Kategorie **oder** einer dieser
+Verhaltensweisen gleicht (exakter Vergleich, Groß-/Kleinschreibung zählt).
+Bisher verglich dieses SDK nur die Kategorie: eine Regel „Training blockieren"
+erreichte Googlebot (Kategorie `search`) nie, obwohl das Dashboard sie als aktiv
+zeigte. Liefert der Dienst keine Verhaltensweisen, bleibt es beim bisherigen
+Kategorievergleich.
+
+### Added
+
+**Regeln vom Typ `spoof` greifen jetzt — gefälschte Agenten lassen sich
+gezielt abweisen, sobald das SDK die Besucheradresse kennt.** Behauptet der
+User-Agent einen bekannten Agenten, veröffentlicht dessen Betreiber IP-Bereiche
+für die Adressfamilie der Anfrage (IPv4 bzw. IPv6) und liegt die Besucheradresse
+in keinem davon, gilt die Identität als widerlegt — genau wie im
+SilentShield-Server. Was sich nicht prüfen lässt, ist **nie** `spoof`, sondern
+nur unbestätigt: keine veröffentlichten Bereiche, nur Bereiche der anderen
+Adressfamilie (etwa ein Googlebot über IPv6, wenn nur IPv4-Bereiche bekannt
+sind), keine auswertbare Adresse — und eine Adresse, die ebenso gut die eines
+Proxys sein kann.
+
+Deshalb ist das Urteil **nur mit einer der beiden neuen Optionen** eingeschaltet:
+
+- `trusted_proxies` — Ihre eigenen Reverse-Proxys (CIDRs oder einzelne
+  Adressen, als Liste oder kommagetrennt). Ist `REMOTE_ADDR` einer davon, wird
+  `X-Forwarded-For` von **rechts** gelesen und die erste Adresse genommen, die
+  kein vertrauter Proxy ist (dieselbe Regel wie im Server). Ist die Gegenstelle
+  kein vertrauter Proxy, zählt sie selbst, und `X-Forwarded-For` wird
+  ignoriert — die Kopfzeile kann jeder mitschicken.
+- `direct_connection => true` — vor PHP steht kein Proxy, `REMOTE_ADDR` ist
+  der Besucher.
+
+Mit einer Option entscheidet dieselbe Adresse auch über „verifiziert". Ohne
+Option bleibt es bei `REMOTE_ADDR` für „verifiziert", eine `spoof`-Regel greift
+nie — sonst würde sie hinter jedem Proxy den echten Googlebot abweisen. Eine
+IPv4-Adresse in IPv6-Schreibweise (`::ffff:a.b.c.d`, wie sie
+Dual-Stack-Server liefern) gilt dabei als IPv4 — sie wird jetzt auch beim
+Abgleich auf „verifiziert" gegen die IPv4-Bereiche geprüft.
+
+**Der Enforcer meldet sich beim Abruf des Policy-Bündels an** — mit der
+Kopfzeile `X-SilentShield-Enforcer: sdk-php/<Version> caps=behaviors`, mit
+`trusted_proxies` oder `direct_connection` `caps=behaviors,spoof`. Daran
+erkennt das Dashboard, welche Einbindung die Regeln ausführt und ob sie Regeln
+auf Verhaltensweisen und auf gefälschte Agenten tatsächlich umsetzt.
+
 ## [1.3.0] — 2026-09-09
 
 ### Added
